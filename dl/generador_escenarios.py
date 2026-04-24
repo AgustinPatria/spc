@@ -1,0 +1,132 @@
+"""Generador de escenarios de retornos futuros (PDF sección 2.5).
+
+Pipeline en dos pasos:
+
+1. `generate_candidate_scenarios`: desde la última ventana observada, simula
+   N trayectorias (por defecto N = 1000) de largo T (por defecto `T_HORIZON`,
+   que coincide con t1..t163 del GAMS). En cada paso:
+     - se predicen los deciles con el LSTM congelado;
+     - se muestrea uniformemente un nivel q ∈ Q (mismo q para todos los
+       activos en ese paso, siguiendo la notación del PDF);
+     - se fija r_cand_{i,t} = r_hat^(q)_{i,t};
+     - se rola la ventana (se descarta el retorno más viejo y se agrega el
+       nuevo) para poder predecir el paso siguiente.
+
+2. `reduce_to_representatives`: ordena los N candidatos por un resumen
+   económico (retorno acumulado del activo de referencia — SPX por defecto),
+   los parte en 5 quintiles del peor al mejor, y elige 1 escenario mediano
+   por quintil. Resultado: S con |S| = 5 trayectorias explicables que
+   alimentan el regret-grid de ps.gms."""
+
+from typing import Optional
+
+import numpy as np
+import torch
+
+from config import T_HORIZON
+from .prediccion_deciles import LoadedModel
+
+
+def generate_candidate_scenarios(
+    model: LoadedModel,
+    initial_window: np.ndarray,
+    N: int = 1000,
+    T: int = T_HORIZON,
+    seed: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Genera N trayectorias de largo T partiendo de `initial_window`.
+
+    initial_window: (H, n_assets)
+    return:         (N, T, n_assets)
+    """
+    cfg = model.config
+    if initial_window.shape != (cfg.H, cfg.n_assets):
+        raise ValueError(
+            f"initial_window shape {initial_window.shape} != (H={cfg.H}, A={cfg.n_assets})"
+        )
+
+    rng = np.random.default_rng(seed)
+    A   = cfg.n_assets
+    Q   = cfg.n_quantiles
+
+    # Una ventana independiente por escenario (todas parten iguales).
+    windows   = np.tile(initial_window.astype(np.float32), (N, 1, 1))   # (N, H, A)
+    scenarios = np.empty((N, T, A), dtype=np.float32)
+
+    for t in range(T):
+        # Predice deciles para los N escenarios en paralelo.
+        x = ((windows - model.mean) / model.std).astype(np.float32)
+        with torch.no_grad():
+            preds = model.net(torch.from_numpy(x)).numpy()              # (N, A, Q)
+
+        # Mismo q para todos los activos en el paso (lectura directa del PDF).
+        q_idx = rng.integers(low=0, high=Q, size=N)                     # (N,)
+        r_t   = np.take_along_axis(
+            preds, q_idx[:, None, None], axis=2
+        ).squeeze(-1)                                                   # (N, A)
+
+        scenarios[:, t, :] = r_t
+
+        # Roll de la ventana: desecha el retorno mas viejo, agrega el recien muestreado.
+        windows = np.concatenate([windows[:, 1:, :], r_t[:, None, :]], axis=1)
+
+    return scenarios
+
+
+def reduce_to_representatives(
+    scenarios: np.ndarray,
+    summary_asset_idx: int = 0,
+    n_quintiles: int = 5,
+) -> np.ndarray:
+    """
+    Reduce los N candidatos a n_quintiles representativos.
+
+    scenarios:         (N, T, n_assets)
+    summary_asset_idx: índice del activo usado como resumen económico
+                       (PDF ec. 17, default SPX = 0).
+    return:            (n_quintiles, T, n_assets)
+    """
+    if scenarios.ndim != 3:
+        raise ValueError(f"scenarios debe ser (N, T, A); recibí {scenarios.shape}")
+    N = scenarios.shape[0]
+    if N < n_quintiles:
+        raise ValueError(f"N={N} insuficiente para {n_quintiles} quintiles")
+
+    # Retorno acumulado del activo resumen por escenario (PDF ec. 17).
+    cum   = np.prod(1.0 + scenarios[:, :, summary_asset_idx], axis=1) - 1.0  # (N,)
+    order = np.argsort(cum)                                                  # peor -> mejor
+
+    # Particion en n_quintiles (el ultimo absorbe el remanente si N no divide).
+    edges = np.linspace(0, N, n_quintiles + 1, dtype=int)
+    reps  = []
+    for k in range(n_quintiles):
+        lo, hi = edges[k], edges[k + 1]
+        bucket = order[lo:hi]
+        mid    = bucket[len(bucket) // 2]    # mediano dentro del quintil
+        reps.append(scenarios[mid])
+
+    return np.stack(reps, axis=0)                                            # (n_q, T, A)
+
+
+def generate_representative_scenarios(
+    model: LoadedModel,
+    initial_window: np.ndarray,
+    N: int = 1000,
+    T: int = T_HORIZON,
+    n_quintiles: int = 5,
+    summary_asset: str = "SPX",
+    seed: Optional[int] = None,
+) -> np.ndarray:
+    """Pipeline completo: genera N candidatos y devuelve n_quintiles representativos."""
+    assets = tuple(model.config.assets)
+    if summary_asset not in assets:
+        raise ValueError(f"summary_asset {summary_asset!r} no está en {assets}")
+    idx = assets.index(summary_asset)
+
+    candidates = generate_candidate_scenarios(
+        model, initial_window, N=N, T=T, seed=seed,
+    )
+    return reduce_to_representatives(
+        candidates, summary_asset_idx=idx, n_quintiles=n_quintiles,
+    )
