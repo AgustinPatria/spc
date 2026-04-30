@@ -4,7 +4,7 @@ Uso:
     python inspeccion/regret_grid/inspeccionar_regret.py
 
 Construye el contexto DL (mu_hat/sigma_hat históricos + p(t) forward por
-rollout mediano + 5 escenarios representativos), corre el regret-grid sobre
+walking-window sobre el histórico + 5 escenarios representativos), corre el regret-grid sobre
 G = Λ × M (5·3 = 15 puntos) y produce:
 
 1. Resumen de contexto DL:
@@ -92,7 +92,7 @@ def turnover_por_politica(policies, assets, T_vals) -> pd.DataFrame:
 # ---------------------------------------------------------------------
 
 def plot_p_bull_forward(p_dl, T_vals, out_path: Path) -> None:
-    """Serie p_bull(t) forward por activo (rollout mediano)."""
+    """Serie p_bull(t) forward por activo (walking-window sobre el histórico)."""
     assets = list(p_dl.keys())
     fig, axes = plt.subplots(
         len(assets), 1, figsize=(10, 3 * len(assets)),
@@ -391,7 +391,7 @@ def inspeccionar(
     print(f"\n[ctx]  assets={assets}  T={ctx['nT']}  "
           f"scenarios={scenarios.shape}")
 
-    print("\n== p_bull(t) forward (rollout con mediana) ==")
+    print("\n== p_bull(t) forward (walking-window) ==")
     for i in assets:
         col = p_dl[i]["bull"]
         print(f"  {i:<8} min={col.min():.3f}  mean={col.mean():.3f}  "

@@ -119,18 +119,20 @@ def rolling_origin_splits(
     X: np.ndarray, Y: np.ndarray, t_idx: np.ndarray,
     initial_train_frac: float = 0.60,
     n_folds: int = 4,
+    rolling_window_non_expansive: bool = False,
 ) -> List[ChronoSplit]:
-    """Walk-forward splits con ventana de train expansiva.
+    """Walk-forward splits con ventana de train expansiva o rolling.
 
     Construye n_folds particiones cronologicas. El tramo inicial
     `initial_train_frac` se reserva solo para entrenar; el resto se divide en
-    n_folds bloques de validacion NO solapados. Cada fold k entrena con todo
-    lo anterior a su validacion (ventana expansiva) — respeta causalidad.
+    n_folds bloques de validacion NO solapados.
 
-      fold k:
-        train = [0              : n_initial + k*v]
-        valid = [n_initial + k*v: n_initial + (k+1)*v]
-        (el ultimo fold absorbe el remanente si no divide exacto)
+    - Modo expansivo (`rolling_window_non_expansive=False`):
+        fold k: train = [0 : n_initial + k*v]  -- crece con cada fold.
+    - Modo rolling-window (`rolling_window_non_expansive=True`):
+        fold k: train = [k*v : n_initial + k*v]  -- tamaño fijo = n_initial,
+        descarta los datos mas viejos a medida que avanza el fold. Util para
+        mitigar drift de distribucion.
 
     El campo test queda vacio: la evaluacion out-of-sample agregada es la
     concatenacion de los n_folds bloques de validacion.
@@ -151,13 +153,14 @@ def rolling_origin_splits(
 
     folds: List[ChronoSplit] = []
     for k in range(n_folds):
-        tr_end = n_initial + k * v
-        va_end = tr_end + v if k < n_folds - 1 else N
+        tr_end   = n_initial + k * v
+        va_end   = tr_end + v if k < n_folds - 1 else N
+        tr_start = (tr_end - n_initial) if rolling_window_non_expansive else 0
         folds.append(ChronoSplit(
-            X_train=X[:tr_end],           Y_train=Y[:tr_end],
+            X_train=X[tr_start : tr_end], Y_train=Y[tr_start : tr_end],
             X_valid=X[tr_end : va_end],   Y_valid=Y[tr_end : va_end],
             X_test =empty_x,              Y_test =empty_y,
-            t_train=t_idx[:tr_end],
+            t_train=t_idx[tr_start : tr_end],
             t_valid=t_idx[tr_end : va_end],
             t_test =empty_t,
         ))
@@ -253,7 +256,16 @@ def _train_one(
     Y_va = torch.tensor(split.Y_valid,               dtype=torch.float32, device=device)
 
     model = QuantileLSTM(config).to(device)
-    optim = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    # Excluir bias del weight_decay: el offset del head linear no debe ser
+    # atraido a 0; si la regularizacion lo penaliza, la mediana predicha queda
+    # sesgada hacia 0 cuando la media historica del retorno es no-nula.
+    decay    = [p for n, p in model.named_parameters() if "bias" not in n]
+    no_decay = [p for n, p in model.named_parameters() if "bias" in n]
+    optim = torch.optim.AdamW(
+        [{"params": decay,    "weight_decay": config.weight_decay},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=config.lr,
+    )
 
     best_valid    = float("inf")
     best_state    = copy.deepcopy(model.state_dict())
@@ -322,19 +334,24 @@ def train_deciles(config: DLConfig) -> TrainResult:
 
 @dataclass
 class RollingResult:
-    """Salida del entrenamiento walk-forward.
+    """Salida del entrenamiento walk-forward con ensemble de seeds.
 
-    - fold_results: mejor TrainResult por fold (seed averaging dentro de cada fold).
+    - fold_results: mejor TrainResult por fold (la seed con mejor valid pinball).
+    - fold_state_dicts: lista de state_dicts por fold — UNA por seed entrenada.
+      La inferencia promedia las K predicciones (ensemble); el sort posterior
+      garantiza monotonicidad de los cuantiles.
     - folds: los ChronoSplit usados, en orden cronologico.
     - oos_preds / oos_Y / oos_t / oos_fold_id: predicciones out-of-sample
       concatenadas en orden cronologico (cada obs viene del fold que la validaba).
     """
-    fold_results: List["TrainResult"]
-    folds:        List[ChronoSplit]
-    oos_preds:    np.ndarray
-    oos_Y:        np.ndarray
-    oos_t:        np.ndarray
-    oos_fold_id:  np.ndarray
+    fold_results:     List["TrainResult"]
+    fold_state_dicts: List[List[Dict]]
+    folds:            List[ChronoSplit]
+    oos_preds:        np.ndarray
+    oos_preds_raw:    np.ndarray
+    oos_Y:            np.ndarray
+    oos_t:            np.ndarray
+    oos_fold_id:      np.ndarray
 
 
 def _rebuild_net(config: DLConfig, state_dict) -> "QuantileLSTM":
@@ -348,22 +365,31 @@ def train_deciles_rolling(
     config: DLConfig,
     initial_train_frac: Optional[float] = None,
     n_folds:            Optional[int]   = None,
+    rolling_window_non_expansive: Optional[bool] = None,
 ) -> RollingResult:
     """Rolling-origin: un modelo por fold con seed averaging + OOS agregadas."""
     if initial_train_frac is None:
         initial_train_frac = getattr(config, "rolling_initial_train_frac", 0.60)
     if n_folds is None:
         n_folds = getattr(config, "rolling_n_folds", 4)
+    if rolling_window_non_expansive is None:
+        rolling_window_non_expansive = getattr(
+            config, "rolling_window_non_expansive", False
+        )
 
     df_ret = load_returns()
     X, Y, t_idx = build_windows(df_ret, config.H)
-    folds = rolling_origin_splits(X, Y, t_idx, initial_train_frac, n_folds)
+    folds = rolling_origin_splits(
+        X, Y, t_idx, initial_train_frac, n_folds, rolling_window_non_expansive,
+    )
 
     fold_results: List[TrainResult] = []
-    oos_preds_list: List[np.ndarray] = []
-    oos_Y_list:     List[np.ndarray] = []
-    oos_t_list:     List[np.ndarray] = []
-    oos_fold_list:  List[np.ndarray] = []
+    fold_state_dicts: List[List[Dict]] = []
+    oos_preds_list:     List[np.ndarray] = []
+    oos_preds_raw_list: List[np.ndarray] = []
+    oos_Y_list:         List[np.ndarray] = []
+    oos_t_list:         List[np.ndarray] = []
+    oos_fold_list:      List[np.ndarray] = []
 
     for k, split in enumerate(folds):
         print(f"\n=== Fold {k + 1}/{n_folds} ===")
@@ -373,38 +399,44 @@ def train_deciles_rolling(
               f"t=[{int(split.t_valid[0])}..{int(split.t_valid[-1])}]")
 
         scaler = fit_standardizer(split.X_train)
-        best_fold: TrainResult | None = None
+        seed_results: List[TrainResult] = []
         for seed in config.seeds:
             r = _train_one(config, split, scaler, seed)
             print(f"    seed={seed}  best_valid={r.best_valid:.6f}")
-            if best_fold is None or r.best_valid < best_fold.best_valid:
-                best_fold = r
-        assert best_fold is not None
-        fold_results.append(best_fold)
+            seed_results.append(r)
 
-        # Predicciones OOS sobre el bloque de validacion de este fold.
+        best_fold = min(seed_results, key=lambda r: r.best_valid)
+        fold_results.append(best_fold)
+        fold_state_dicts.append([r.state_dict for r in seed_results])
+
+        # Predicciones OOS con ENSEMBLE: promedio de las K seeds del fold.
+        nets_fold = [_rebuild_net(config, sd) for sd in fold_state_dicts[-1]]
         loaded = LoadedModel(
-            net=_rebuild_net(config, best_fold.state_dict),
+            nets=nets_fold,
             config=config,
             mean=best_fold.mean,
             std=best_fold.std,
         )
-        preds_va = predict_deciles_batch(loaded, split.X_valid)       # (n_va, A, Q)
+        preds_va     = predict_deciles_batch(loaded, split.X_valid)               # (n_va, A, Q)
+        preds_va_raw = predict_deciles_batch(loaded, split.X_valid, sort=False)   # (n_va, A, Q)
         oos_preds_list.append(preds_va)
+        oos_preds_raw_list.append(preds_va_raw)
         oos_Y_list.append(split.Y_valid)
         oos_t_list.append(split.t_valid)
         oos_fold_list.append(np.full(len(split.X_valid), k, dtype=np.int64))
 
         print(f"  fold best_valid={best_fold.best_valid:.6f}  "
-              f"seed={best_fold.best_seed}  epochs={len(best_fold.history['train'])}")
+              f"best_seed={best_fold.best_seed}  ensemble_size={len(seed_results)}")
 
     return RollingResult(
         fold_results=fold_results,
+        fold_state_dicts=fold_state_dicts,
         folds=folds,
-        oos_preds   =np.concatenate(oos_preds_list, axis=0),
-        oos_Y       =np.concatenate(oos_Y_list,     axis=0),
-        oos_t       =np.concatenate(oos_t_list,     axis=0),
-        oos_fold_id =np.concatenate(oos_fold_list,  axis=0),
+        oos_preds     =np.concatenate(oos_preds_list,     axis=0),
+        oos_preds_raw =np.concatenate(oos_preds_raw_list, axis=0),
+        oos_Y         =np.concatenate(oos_Y_list,         axis=0),
+        oos_t         =np.concatenate(oos_t_list,         axis=0),
+        oos_fold_id   =np.concatenate(oos_fold_list,      axis=0),
     )
 
 
@@ -414,7 +446,7 @@ def train_deciles_rolling(
 
 @dataclass
 class LoadedModel:
-    net:      QuantileLSTM
+    nets:     List[QuantileLSTM]
     config:   DLConfig
     mean:     np.ndarray
     std:      np.ndarray
@@ -451,7 +483,8 @@ def save_rolling_checkpoint(
     last = result.fold_results[-1]
 
     folds_payload = [{
-        "state_dict":  fr.state_dict,
+        "state_dict":  fr.state_dict,                       # mejor seed (back-compat)
+        "state_dicts": result.fold_state_dicts[k],          # ensemble (todas las seeds)
         "mean":        fr.mean,
         "std":         fr.std,
         "history":     fr.history,
@@ -462,19 +495,21 @@ def save_rolling_checkpoint(
     } for k, fr in enumerate(result.fold_results)]
 
     payload = {
-        "state_dict": last.state_dict,
-        "config":     config,
-        "mean":       last.mean,
-        "std":        last.std,
-        "history":    last.history,
-        "best_seed":  last.best_seed,
-        "best_valid": last.best_valid,
-        "folds":      folds_payload,
+        "state_dict":  last.state_dict,                     # mejor seed (back-compat)
+        "state_dicts": result.fold_state_dicts[-1],         # ensemble del ultimo fold
+        "config":      config,
+        "mean":        last.mean,
+        "std":         last.std,
+        "history":     last.history,
+        "best_seed":   last.best_seed,
+        "best_valid":  last.best_valid,
+        "folds":       folds_payload,
         "oos": {
-            "preds":   result.oos_preds,
-            "Y":       result.oos_Y,
-            "t":       result.oos_t,
-            "fold_id": result.oos_fold_id,
+            "preds":     result.oos_preds,
+            "preds_raw": result.oos_preds_raw,
+            "Y":         result.oos_Y,
+            "t":         result.oos_t,
+            "fold_id":   result.oos_fold_id,
         },
     }
     torch.save(payload, path)
@@ -484,19 +519,28 @@ def load_checkpoint(path: Path | str) -> LoadedModel:
     path = Path(path)
     payload = torch.load(path, map_location="cpu", weights_only=False)
     config: DLConfig = payload["config"]
-    net = QuantileLSTM(config)
-    net.load_state_dict(payload["state_dict"])
-    net.eval()
+    # Ensemble: usa state_dicts (lista) si existe; si no, fallback a state_dict singular.
+    state_dicts = payload.get("state_dicts") or [payload["state_dict"]]
+    nets: List[QuantileLSTM] = []
+    for sd in state_dicts:
+        net = QuantileLSTM(config)
+        net.load_state_dict(sd)
+        net.eval()
+        nets.append(net)
     return LoadedModel(
-        net=net, config=config,
+        nets=nets, config=config,
         mean=np.asarray(payload["mean"], dtype=np.float32),
         std=np.asarray(payload["std"],  dtype=np.float32),
     )
 
 
-def predict_deciles(model: LoadedModel, window: np.ndarray) -> Dict[str, Dict[float, float]]:
+def predict_deciles(
+    model: LoadedModel, window: np.ndarray, sort: bool = True,
+) -> Dict[str, Dict[float, float]]:
     """
     window: (H, n_assets)  ->  {asset: {q: r_hat}} con un retorno predicho por decil.
+    Si sort=True (default) se ordenan los deciles por activo para garantizar
+    monotonicidad; sort=False devuelve la salida cruda de la red.
     """
     cfg = model.config
     if window.shape != (cfg.H, cfg.n_assets):
@@ -505,7 +549,10 @@ def predict_deciles(model: LoadedModel, window: np.ndarray) -> Dict[str, Dict[fl
     x = ((window.astype(np.float32) - model.mean) / model.std)
     x = torch.from_numpy(x).unsqueeze(0)                               # (1, H, A)
     with torch.no_grad():
-        out = model.net(x).numpy()[0]                                  # (A, Q)
+        outs = [net(x).numpy()[0] for net in model.nets]               # K * (A, Q)
+    out = np.mean(np.stack(outs, axis=0), axis=0)                      # ensemble
+    if sort:
+        out = np.sort(out, axis=-1)
 
     return {
         asset: {float(q): float(out[ai, qi]) for qi, q in enumerate(cfg.quantiles)}
@@ -513,13 +560,25 @@ def predict_deciles(model: LoadedModel, window: np.ndarray) -> Dict[str, Dict[fl
     }
 
 
-def predict_deciles_batch(model: LoadedModel, windows: np.ndarray) -> np.ndarray:
-    """windows: (N, H, n_assets)  ->  (N, n_assets, n_deciles)."""
+def predict_deciles_batch(
+    model: LoadedModel, windows: np.ndarray, sort: bool = True,
+) -> np.ndarray:
+    """windows: (N, H, n_assets)  ->  (N, n_assets, n_deciles).
+
+    Si sort=True (default) se ordenan los deciles a lo largo del eje Q para que
+    sean monotonicos crecientes por (escenario, activo). sort=False devuelve la
+    salida cruda — util para diagnosticar cuantas veces la red viola la
+    monotonicidad antes de corregir.
+    """
     if windows.ndim != 3:
         raise ValueError(f"windows debe tener shape (N, H, A); recibí {windows.shape}")
     x = ((windows.astype(np.float32) - model.mean) / model.std)
+    x_tensor = torch.from_numpy(x)
     with torch.no_grad():
-        out = model.net(torch.from_numpy(x)).numpy()                   # (N, A, Q)
+        outs = [net(x_tensor).numpy() for net in model.nets]           # K * (N, A, Q)
+    out = np.mean(np.stack(outs, axis=0), axis=0)                      # ensemble
+    if sort:
+        out = np.sort(out, axis=-1)
     return out
 
 

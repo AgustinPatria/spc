@@ -322,9 +322,10 @@ def _print_resumen_candidatos(
 
 def _print_resumen_representativos(
     reps: np.ndarray, cfg: DLConfig, summary_asset_idx: int,
+    label: str = "representativos",
 ) -> None:
     term = _terminal_cumret(reps)                            # (n_q, A)
-    print("\n== Retorno acumulado terminal — representativos ==")
+    print(f"\n== Retorno acumulado terminal — {label} ==")
     header = f"  {'quintil':<8} " + " ".join(f"{a:>10}" for a in cfg.assets)
     print(header)
     print("  " + "-" * (len(header) - 2))
@@ -373,7 +374,13 @@ def inspeccionar(
     )                                                         # (N, T, A)
     reps = reduce_to_representatives(
         candidates, summary_asset_idx=summary_idx, n_quintiles=n_quintiles,
+        position="min",
     )                                                         # (n_q, T, A)
+    # Comparativa contra el default del PDF (mediano del quintil).
+    reps_median = reduce_to_representatives(
+        candidates, summary_asset_idx=summary_idx, n_quintiles=n_quintiles,
+        position="median",
+    )
 
     # ---- Estadísticas de candidatos ----
     resumen = resumen_candidatos(candidates, summary_idx, cfg)
@@ -389,8 +396,11 @@ def inspeccionar(
         print(f"  {t+1:>4}  {q05:>+8.2%} {q25:>+8.2%} {q50:>+8.2%} "
               f"{q75:>+8.2%} {q95:>+8.2%}")
 
-    # ---- Representativos ----
-    _print_resumen_representativos(reps, cfg, summary_idx)
+    # ---- Representativos: comparativa min vs median ----
+    _print_resumen_representativos(reps_median, cfg, summary_idx,
+                                   label="representativos (median del quintil, default PDF)")
+    _print_resumen_representativos(reps,        cfg, summary_idx,
+                                   label="representativos (min del quintil, MAS PESIMISTA)")
 
     # ---- Reproducibilidad ----
     cand2 = generate_candidate_scenarios(

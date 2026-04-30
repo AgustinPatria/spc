@@ -43,7 +43,9 @@ from dl.prediccion_deciles import (
     load_checkpoint,
     load_returns,
 )
-from dl.regimen_predicted import regimen_probabilities
+from dl.regimen_predicted import regimen_from_deciles, regimen_probabilities
+
+import torch
 
 
 # ---------------------------------------------------------------------
@@ -300,6 +302,14 @@ def inspeccionar(
     model = load_checkpoint(ckpt_path)
     cfg   = model.config
 
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    is_rolling = "oos" in payload and "folds" in payload
+    if is_rolling:
+        print("[ckpt] modo rolling-origin detectado — uso preds OOS agregadas.")
+        _inspeccionar_rolling(payload, model, cfg, out_dir)
+        return
+
+    print("[ckpt] modo split unico (legacy).")
     df_ret = load_returns()
     X, Y, t_idx = build_windows(df_ret, cfg.H)
     split: ChronoSplit = chrono_split(X, Y, t_idx, cfg.split)
@@ -368,6 +378,108 @@ def inspeccionar(
         out_dir / "histograma.png",
     )
     plot_scatter(p_te, split.Y_test, cfg, out_dir / "scatter_pbull_vs_retorno.png")
+
+
+def _inspeccionar_rolling(payload, model, cfg, out_dir):
+    """Flujo rolling-origin: usa las preds OOS agregadas + el train del fold 1.
+
+    Las metricas y graficos de OOS se calculan sobre las preds_oos guardadas
+    (cada obs predicha por el fold que la validaba — sin fuga). Para el
+    baseline 'frecuencia de bull en train' usamos el train del fold 1
+    (datos vistos por el primer modelo).
+    """
+    out_dir = Path(out_dir)
+    oos    = payload["oos"]
+    folds  = payload["folds"]
+    preds  = np.asarray(oos["preds"])         # (N_oos, A, Q) — ya ordenados
+    Y_oos  = np.asarray(oos["Y"])             # (N_oos, A)
+    t_oos  = np.asarray(oos["t"])             # (N_oos,)
+    fid    = np.asarray(oos["fold_id"])       # (N_oos,)
+
+    # p_bull viene directo de los deciles OOS.
+    p_oos, _ = regimen_from_deciles(preds)    # (N_oos, A)
+
+    # Frecuencia de bull en el train del fold 1 — base coherente para el baseline.
+    df_ret = load_returns()
+    X_full, Y_full, t_full = build_windows(df_ret, cfg.H)
+    t_train_end_f1 = int(folds[0]["t_train_end"])
+    train_mask = t_full <= t_train_end_f1
+    Y_train_f1 = Y_full[train_mask]
+    pct_bull_train = (Y_train_f1 >= 0.0).mean(axis=0)        # (A,)
+
+    print(f"[cfg]  H={cfg.H}  assets={cfg.assets}  deciles={cfg.quantiles}")
+    print(f"[data] N_oos={len(Y_oos)} (vs split unico legacy)  "
+          f"folds={len(folds)}  train_fold1={int(train_mask.sum())} obs")
+
+    # ---- Metricas por fold + agregada ----
+    print("\n== Metricas de regimen por fold (OOS) ==")
+    print(f"  {'fold':<5} {'activo':<8} {'n':>4} {'brier':>8} {'logloss':>8} {'acc':>6} "
+          f"{'%bull_pred':>11} {'%bull_real':>11}")
+    print("  " + "-" * 66)
+    for k in range(len(folds)):
+        mask = (fid == k)
+        if mask.sum() == 0:
+            continue
+        m = _metricas_split(p_oos[mask], Y_oos[mask], cfg)
+        for asset in cfg.assets:
+            mm = m[asset]
+            print(f"  {k+1:<5} {asset:<8} {int(mask.sum()):>4} "
+                  f"{mm['brier']:>8.4f} {mm['log_loss']:>8.4f} {mm['accuracy']:>6.2%} "
+                  f"{mm['pct_bull_pred']:>11.2%} {mm['pct_bull_real']:>11.2%}")
+
+    print("\n== Metricas agregadas (OOS) ==")
+    metricas_oos = _metricas_split(p_oos, Y_oos, cfg)
+    for asset in cfg.assets:
+        m = metricas_oos[asset]
+        print(f"  {asset:<8} brier={m['brier']:.4f}  logloss={m['log_loss']:.4f}  "
+              f"acc={m['accuracy']:.2%}  "
+              f"%bull_pred={m['pct_bull_pred']:.2%}  %bull_real={m['pct_bull_real']:.2%}")
+
+    # ---- Baseline trivial vs modelo (sobre OOS) ----
+    print("\n== Baseline trivial (p_bull constante = freq. bull en train fold 1) ==")
+    for ai, asset in enumerate(cfg.assets):
+        p_const = np.full_like(p_oos[:, ai], pct_bull_train[ai])
+        y_oos_a = (Y_oos[:, ai] >= 0.0).astype(np.float32)
+        print(
+            f"  {asset:<8} p_const={pct_bull_train[ai]:.2%}  "
+            f"OOS_brier_modelo={metricas_oos[asset]['brier']:.4f}  "
+            f"OOS_brier_baseline={_brier(p_const, y_oos_a):.4f}  "
+            f"(menor = mejor)"
+        )
+
+    # ---- Matriz de confusion sobre OOS ----
+    print("\n== Matriz de confusion @ 0.5 (OOS agregada) ==")
+    for ai, asset in enumerate(cfg.assets):
+        y_oos_a = (Y_oos[:, ai] >= 0.0).astype(int)
+        tp, tn, fp, fn = _confusion(p_oos[:, ai], y_oos_a)
+        print(f"  {asset}:")
+        print(f"    pred bull | real bull  TP={tp:>3}   real bear  FP={fp:>3}")
+        print(f"    pred bear | real bull  FN={fn:>3}   real bear  TN={tn:>3}")
+
+    # ---- Tabla cruda y CSV ----
+    print("\n== Predicciones de regimen — OOS agregada ==")
+    _print_tabla_predicciones(p_oos, Y_oos, t_oos, cfg)
+
+    # CSV: una fila por t OOS, etiquetada con el fold que la valido.
+    fold_label = np.array([f"fold{int(k)+1}" for k in fid])
+    p_split_csv = {f: p_oos[fid == k] for k, f in enumerate(np.unique(fold_label))}
+    y_split_csv = {f: Y_oos[fid == k] for k, f in enumerate(np.unique(fold_label))}
+    t_split_csv = {f: t_oos[fid == k] for k, f in enumerate(np.unique(fold_label))}
+    _guardar_csv_predicciones(
+        p_splits=p_split_csv, y_splits=y_split_csv, t_splits=t_split_csv,
+        cfg=cfg, out_path=out_dir / "predicciones_regimen.csv",
+    )
+
+    # ---- Graficos sobre OOS ----
+    plot_serie_probabilidad(
+        p_oos, Y_oos, t_oos, cfg, out_dir / "serie_p_bull_oos.png",
+    )
+    plot_reliability(p_oos, Y_oos, cfg, out_dir / "reliability.png", n_bins=5)
+    # Histograma por fold (un panel por fold).
+    p_por_fold = {f"fold{k+1}": p_oos[fid == k] for k in range(len(folds))
+                  if (fid == k).any()}
+    plot_histograma(p_por_fold, cfg, out_dir / "histograma.png")
+    plot_scatter(p_oos, Y_oos, cfg, out_dir / "scatter_pbull_vs_retorno.png")
 
 
 if __name__ == "__main__":

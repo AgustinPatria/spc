@@ -304,8 +304,10 @@ def _inspeccionar_split_unico(ckpt_path, payload, model, cfg, out_dir):
     print(f"  valid = {pbv:.6f}")
     print(f"  test  = {pbT:.6f}")
 
-    preds_test = predict_deciles_batch(model, split.X_test)
-    _reportar_metricas("test", preds_test, split.Y_test, cfg)
+    preds_test     = predict_deciles_batch(model, split.X_test)
+    preds_test_raw = predict_deciles_batch(model, split.X_test, sort=False)
+    _reportar_metricas("test", preds_test, split.Y_test, cfg,
+                       preds_raw=preds_test_raw)
 
     history = payload.get("history", {})
     print(f"\n[ckpt] best_seed={payload.get('best_seed')}  "
@@ -328,12 +330,13 @@ def _inspeccionar_split_unico(ckpt_path, payload, model, cfg, out_dir):
 
 def _inspeccionar_rolling(ckpt_path, payload, model, cfg, out_dir):
     """Flujo rolling-origin: usa las predicciones OOS agregadas."""
-    oos    = payload["oos"]
-    folds  = payload["folds"]
-    preds  = np.asarray(oos["preds"])
-    Y_oos  = np.asarray(oos["Y"])
-    t_oos  = np.asarray(oos["t"])
-    fid    = np.asarray(oos["fold_id"])
+    oos       = payload["oos"]
+    folds     = payload["folds"]
+    preds     = np.asarray(oos["preds"])
+    preds_raw = np.asarray(oos["preds_raw"]) if "preds_raw" in oos else preds
+    Y_oos     = np.asarray(oos["Y"])
+    t_oos     = np.asarray(oos["t"])
+    fid       = np.asarray(oos["fold_id"])
 
     n_folds = len(folds)
     print(f"[cfg]  H={cfg.H}  assets={cfg.assets}  deciles={cfg.quantiles}")
@@ -358,7 +361,7 @@ def _inspeccionar_rolling(ckpt_path, payload, model, cfg, out_dir):
     print(f"  {'AGREG':<6} {len(Y_oos):>7}  {'(OOS)':<12}  {pb_all:>10.6f}")
 
     # ---- Cruces, cobertura, resumen sobre las OOS ----
-    _reportar_metricas("OOS agregadas", preds, Y_oos, cfg)
+    _reportar_metricas("OOS agregadas", preds, Y_oos, cfg, preds_raw=preds_raw)
 
     # ---- Graficos ----
     out_dir = Path(out_dir)
@@ -386,9 +389,16 @@ def _inspeccionar_rolling(ckpt_path, payload, model, cfg, out_dir):
     )
 
 
-def _reportar_metricas(nombre: str, preds: np.ndarray, Y: np.ndarray, cfg: DLConfig) -> None:
-    """Imprime cruces, cobertura empirica y resumen por activo sobre `preds`/`Y`."""
-    cruces = pct_cruces(preds)
+def _reportar_metricas(
+    nombre: str, preds: np.ndarray, Y: np.ndarray, cfg: DLConfig,
+    preds_raw: np.ndarray | None = None,
+) -> None:
+    """Imprime cruces, cobertura empirica y resumen por activo sobre `preds`/`Y`.
+
+    Si se pasa `preds_raw`, los cruces se miden sobre esa salida cruda (sin
+    sort) — necesario porque `predict_deciles_batch` ahora ordena por defecto.
+    """
+    cruces = pct_cruces(preds_raw if preds_raw is not None else preds)
     print(f"\n== Cruces de deciles ({nombre}) ==")
     for ai, asset in enumerate(cfg.assets):
         print(f"  {asset}: {cruces[ai]:5.2f}% de ventanas con al menos un cruce")

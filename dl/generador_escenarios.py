@@ -55,10 +55,14 @@ def generate_candidate_scenarios(
     scenarios = np.empty((N, T, A), dtype=np.float32)
 
     for t in range(T):
-        # Predice deciles para los N escenarios en paralelo.
+        # Predice deciles para los N escenarios en paralelo (ensemble de seeds).
         x = ((windows - model.mean) / model.std).astype(np.float32)
+        x_tensor = torch.from_numpy(x)
         with torch.no_grad():
-            preds = model.net(torch.from_numpy(x)).numpy()              # (N, A, Q)
+            preds_list = [net(x_tensor).numpy() for net in model.nets]  # K * (N, A, Q)
+        preds = np.mean(np.stack(preds_list, axis=0), axis=0)
+        # Garantizamos monotonicidad: q_idx=0 debe ser el peor caso para cada activo.
+        preds = np.sort(preds, axis=-1)
 
         # Mismo q para todos los activos en el paso (lectura directa del PDF).
         q_idx = rng.integers(low=0, high=Q, size=N)                     # (N,)
@@ -78,20 +82,27 @@ def reduce_to_representatives(
     scenarios: np.ndarray,
     summary_asset_idx: int = 0,
     n_quintiles: int = 5,
+    position: str = "median",
 ) -> np.ndarray:
     """
     Reduce los N candidatos a n_quintiles representativos.
 
     scenarios:         (N, T, n_assets)
-    summary_asset_idx: índice del activo usado como resumen económico
+    summary_asset_idx: indice del activo usado como resumen economico
                        (PDF ec. 17, default SPX = 0).
+    position:          que escenario tomar dentro de cada quintil.
+                       - "median" (default, ejemplo del PDF): el mediano del bucket
+                       - "min":    el peor del bucket (mas pesimista en cada quintil)
+                       - "max":    el mejor del bucket
     return:            (n_quintiles, T, n_assets)
     """
     if scenarios.ndim != 3:
-        raise ValueError(f"scenarios debe ser (N, T, A); recibí {scenarios.shape}")
+        raise ValueError(f"scenarios debe ser (N, T, A); recibi {scenarios.shape}")
     N = scenarios.shape[0]
     if N < n_quintiles:
         raise ValueError(f"N={N} insuficiente para {n_quintiles} quintiles")
+    if position not in {"median", "min", "max"}:
+        raise ValueError(f"position invalido: {position!r}")
 
     # Retorno acumulado del activo resumen por escenario (PDF ec. 17).
     cum   = np.prod(1.0 + scenarios[:, :, summary_asset_idx], axis=1) - 1.0  # (N,)
@@ -103,8 +114,10 @@ def reduce_to_representatives(
     for k in range(n_quintiles):
         lo, hi = edges[k], edges[k + 1]
         bucket = order[lo:hi]
-        mid    = bucket[len(bucket) // 2]    # mediano dentro del quintil
-        reps.append(scenarios[mid])
+        if   position == "median": idx = bucket[len(bucket) // 2]
+        elif position == "min":    idx = bucket[0]
+        else:                      idx = bucket[-1]   # max
+        reps.append(scenarios[idx])
 
     return np.stack(reps, axis=0)                                            # (n_q, T, A)
 
@@ -117,16 +130,17 @@ def generate_representative_scenarios(
     n_quintiles: int = 5,
     summary_asset: str = "SPX",
     seed: Optional[int] = None,
+    position: str = "median",
 ) -> np.ndarray:
     """Pipeline completo: genera N candidatos y devuelve n_quintiles representativos."""
     assets = tuple(model.config.assets)
     if summary_asset not in assets:
-        raise ValueError(f"summary_asset {summary_asset!r} no está en {assets}")
+        raise ValueError(f"summary_asset {summary_asset!r} no esta en {assets}")
     idx = assets.index(summary_asset)
 
     candidates = generate_candidate_scenarios(
         model, initial_window, N=N, T=T, seed=seed,
     )
     return reduce_to_representatives(
-        candidates, summary_asset_idx=idx, n_quintiles=n_quintiles,
+        candidates, summary_asset_idx=idx, n_quintiles=n_quintiles, position=position,
     )

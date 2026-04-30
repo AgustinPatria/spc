@@ -296,27 +296,46 @@ def solve_portfolio(theta: dict, context: dict,
 
 
 # ================================================================
-# 1) DL: rollout deterministico para p_bull(t) forward
+# 1) DL: walking-window sobre el historico para p_bull(t)
 # ================================================================
 
-def predict_pbull_rollout(model, initial_window, T):
-    """Rollout con la mediana (q=0.5) -> p_bull(t) para t=1..T; retorna (T, A)."""
-    cfg   = model.config
-    med_q = cfg.n_quantiles // 2   # indice del decil mediano (q=0.5)
+def predict_pbull_walking(model, returns_history, T):
+    """p_bull(t) por ventana real del historico, sin autoalimentar.
 
-    window = initial_window.astype(np.float32).copy()
-    p_bull = np.empty((T, cfg.n_assets), dtype=np.float32)
+    Para cada t en H+1..T se aplica el LSTM a la ventana real
+    [r_{t-H}..r_{t-1}] y se deriva p_bull(t) via la ec. 15 del PDF.
+    Para t=1..H no hay H retornos previos en el dataset; esas posiciones
+    se rellenan por padding con p_bull(H+1) (decision documentada para
+    no romper la alineacion temporal con el GAMS base, T_vals=1..T).
 
-    for t in range(T):
+    returns_history: (T, A) retornos reales por activo, indexados 0..T-1
+                     (returns_history[k] corresponde a la semana t=k+1).
+    return:          (T, A) p_bull alineado a t=1..T.
+    """
+    cfg = model.config
+    H   = cfg.H
+    A   = cfg.n_assets
+    if returns_history.shape != (T, A):
+        raise ValueError(
+            f"returns_history shape {returns_history.shape} != (T={T}, A={A})"
+        )
+    if T <= H:
+        raise ValueError(f"T={T} debe ser > H={H} para tener al menos una ventana real.")
+
+    p_bull = np.empty((T, A), dtype=np.float32)
+
+    for idx in range(H, T):                          # idx 0-based; semana t1 = idx+1
+        window = returns_history[idx - H : idx, :]   # (H, A) ventana real previa
         x = ((window - model.mean) / model.std).astype(np.float32)[None, :, :]
+        x_tensor = torch.from_numpy(x)
         with torch.no_grad():
-            preds = model.net(torch.from_numpy(x)).numpy()[0]   # (A, Q)
-        p_bull_step, _ = regimen_from_deciles(preds)            # (A,)
-        p_bull[t] = p_bull_step
+            outs = [net(x_tensor).numpy()[0] for net in model.nets]  # K * (A, Q)
+        preds = np.mean(np.stack(outs, axis=0), axis=0)              # (A, Q)
+        p_bull_step, _ = regimen_from_deciles(preds)                 # (A,)
+        p_bull[idx] = p_bull_step
 
-        median_r = preds[:, med_q]                              # (A,)
-        window   = np.concatenate([window[1:], median_r[None, :]], axis=0)
-
+    # Padding para t=1..H (no hay ventana real previa de tamaño H).
+    p_bull[:H] = p_bull[H]
     return p_bull
 
 
@@ -352,7 +371,8 @@ def _compute_hist_moments(r_hist, p_hist, assets, regimes):
 
 def build_dl_context(data_dir, checkpoint_path, T=T_HORIZON,
                      N_candidates=N_CANDIDATES, n_scenarios=N_SCENARIOS,
-                     seed=SCENARIO_SEED, summary_asset=SUMMARY_ASSET):
+                     seed=SCENARIO_SEED, summary_asset=SUMMARY_ASSET,
+                     position=None):
     """
     Construye un contexto compatible con solve_portfolio donde:
       - mu_hat/sigma_hat son historicos (iguales a la base).
@@ -376,15 +396,16 @@ def build_dl_context(data_dir, checkpoint_path, T=T_HORIZON,
 
     mu_hat, sigma_hat = _compute_hist_moments(r_hist, p_hist, assets, regimes)
 
-    # --- modelo DL + ventana inicial (ultimos H retornos observados) ---
+    # --- modelo DL + historico completo de retornos para walking-window ---
     model = load_checkpoint(checkpoint_path)
     H     = model.config.H
-    initial_window = np.stack(
-        [r_hist[i].sort_index().values[-H:] for i in assets], axis=1,
-    ).astype(np.float32)                                 # (H, A)
+    returns_history = np.stack(
+        [r_hist[i].sort_index().values[:T] for i in assets], axis=1,
+    ).astype(np.float32)                                 # (T, A)
+    initial_window = returns_history[-H:, :]             # (H, A) — para escenarios
 
-    # --- p_bull(t) forward por rollout deterministico ---
-    p_bull_dl = predict_pbull_rollout(model, initial_window, T)   # (T, A)
+    # --- p_bull(t) por ventana real del historico (sin autoalimentar) ---
+    p_bull_dl = predict_pbull_walking(model, returns_history, T)  # (T, A)
     p_bear_dl = 1.0 - p_bull_dl
     T_vals    = list(range(1, T + 1))
     p_dl = {
@@ -414,11 +435,13 @@ def build_dl_context(data_dir, checkpoint_path, T=T_HORIZON,
             sigma_mix[j][i] = sym
 
     # --- 5 escenarios representativos para la simulacion ex-post ---
+    from config import SCENARIO_POSITION
+    pos = position if position is not None else SCENARIO_POSITION
     scenarios = generate_representative_scenarios(
         model, initial_window,
         N=N_candidates, T=T,
         n_quintiles=n_scenarios, summary_asset=summary_asset,
-        seed=seed,
+        seed=seed, position=pos,
     )                                                    # (n_scenarios, T, A)
 
     return {
@@ -443,8 +466,11 @@ def build_dl_context(data_dir, checkpoint_path, T=T_HORIZON,
 def simulate_capital_on_scenario(w_sol, u_sol, v_sol, scenario,
                                  assets, c_base, C0, T_vals):
     """
-    Ec. (19): cap[t] = cap[t-1]*(1 + sum_i w(i,t-1)*r^s_{i,t-1})
-                     - cap[t-1]*sum_i c_i*(u(i,t) + v(i,t))
+    Ec. (19): x_{t+1} = x_t (1 + sum_i w(i,t)*r^s_{i,t})
+                      - x_t sum_i c_i * |w(i,t) - w(i,t-1)|
+    El costo cobrado en el paso t->t+1 es el del rebalanceo HACIA w(t),
+    es decir u(i,t)+v(i,t). En el primer paso (t=t1) eso captura el
+    rebalanceo inicial w0 -> w(t1).
     scenario: (T, A) — scenario[k, ai] es el retorno en el periodo T_vals[k].
     """
     cap = {T_vals[0]: C0}
@@ -453,7 +479,7 @@ def simulate_capital_on_scenario(w_sol, u_sol, v_sol, scenario,
         t_prev = T_vals[idx - 1]
         r_port = sum(w_sol[i, t_prev] * scenario[idx - 1, ai]
                      for ai, i in enumerate(assets))
-        turn   = sum(c_base[i] * (u_sol[i, t] + v_sol[i, t]) for i in assets)
+        turn   = sum(c_base[i] * (u_sol[i, t_prev] + v_sol[i, t_prev]) for i in assets)
         cap[t] = cap[t_prev] * (1.0 + r_port) - cap[t_prev] * turn
     return cap
 
@@ -534,9 +560,12 @@ def compute_regret_and_select(V_df):
 # ================================================================
 
 def simulate_capital_opt(w_sol, u_sol, v_sol, context):
-    """Capital ex-post bajo retornos historicos (Sec. 4 del GAMS).
+    """Capital ex-post bajo retornos historicos (ec. 19, version historica).
 
-    cap[t] = cap[t-1] * (1 + r_port[t-1]) - cap[t-1] * sum_i c_base(i)*(u(i,t)+v(i,t)).
+    cap[t] = cap[t-1] * (1 + sum_i w(i,t-1)*r(i,t-1))
+           - cap[t-1] * sum_i c_base(i)*(u(i,t-1)+v(i,t-1)).
+    El costo del paso t-1 -> t es el del rebalanceo HACIA w(t-1) (incluye
+    el rebalanceo inicial w0 -> w(t1) en el primer paso).
     Siempre usa c_base (sin multiplicador): el costo_mult solo penaliza ex-ante en la FO.
     """
     T_vals  = context["T_vals"]
@@ -550,7 +579,7 @@ def simulate_capital_opt(w_sol, u_sol, v_sol, context):
         t      = T_vals[idx]
         t_prev = T_vals[idx - 1]
         r_port = sum(w_sol[i, t_prev] * r[i].loc[t_prev] for i in assets)
-        turn   = sum(c_base[i] * (u_sol[i, t] + v_sol[i, t]) for i in assets)
+        turn   = sum(c_base[i] * (u_sol[i, t_prev] + v_sol[i, t_prev]) for i in assets)
         cap[t] = cap[t_prev] * (1.0 + r_port) - cap[t_prev] * turn
     return cap
 

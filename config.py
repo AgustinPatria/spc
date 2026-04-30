@@ -74,15 +74,15 @@ BULL_THRESHOLD: float = 0.0
 # 4) Deep Learning (LSTM cuantilica + entrenamiento)
 # =====================================================================
 # Deciles objetivo del LSTM (PDF ec. 12, adaptacion de los quintiles).
-DECILES: Tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+DECILES: Tuple[float, ...] = (0.1, 0.3, 0.5, 0.7, 0.9)
 
 # Hiperparametros por defecto (reflejados en DLConfig).
-H_WINDOW:     int   = 22       # largo de la ventana del LSTM
-LSTM_HIDDEN:  int   = 16
-LSTM_LAYERS:  int   = 1
-DROPOUT:      float = 0.3
+H_WINDOW:     int   = 52       # largo de la ventana del LSTM (PDF sec. 2.2 ejemplo)
+LSTM_HIDDEN:  int   = 24       # sweep config B (compromiso pinball/calibracion)
+LSTM_LAYERS:  int   = 2        # PDF sec. 2.3 permite 1-3; sweep eligio 2
+DROPOUT:      float = 0.1
 LR:           float = 1e-3
-WEIGHT_DECAY: float = 1e-3
+WEIGHT_DECAY: float = 1e-4
 EPOCHS:       int   = 300
 PATIENCE:     int   = 15
 BATCH_SIZE:   Optional[int] = None   # None => batch completo
@@ -98,6 +98,9 @@ DEVICE:       str   = "cpu"
 # lo que da un conjunto "out-of-sample" agregado mucho mas grande que un split unico.
 ROLLING_INITIAL_TRAIN_FRAC: float = 0.60
 ROLLING_N_FOLDS:            int   = 4
+# Si True, cada fold descarta los datos mas viejos para mantener un train
+# de tamaño fijo (= initial_train_frac * N). Si False, train expansivo.
+ROLLING_WINDOW_NON_EXPANSIVE: bool = True
 
 
 @dataclass
@@ -119,6 +122,7 @@ class DLConfig:
     device:       str                    = DEVICE
     rolling_initial_train_frac: float    = ROLLING_INITIAL_TRAIN_FRAC
     rolling_n_folds:            int      = ROLLING_N_FOLDS
+    rolling_window_non_expansive: bool   = ROLLING_WINDOW_NON_EXPANSIVE
 
     @property
     def n_quantiles(self) -> int:
@@ -132,10 +136,12 @@ class DLConfig:
 # =====================================================================
 # 5) Generador de escenarios (seccion 2.5)
 # =====================================================================
-N_CANDIDATES:   int = 5000
+N_CANDIDATES:   int = 1000
 N_SCENARIOS:    int = 5            # quintiles representativos
 SUMMARY_ASSET:  str = "SPX"        # activo usado para ordenar escenarios
 SCENARIO_SEED:  int = 0
+# "median" (PDF default), "min" (mas pesimista por quintil), "max"
+SCENARIO_POSITION: str = "median"
 
 
 @dataclass
@@ -145,6 +151,7 @@ class ScenarioConfig:
     summary_asset: str = SUMMARY_ASSET
     T:             int = T_HORIZON
     seed:          int = SCENARIO_SEED
+    position:      str = SCENARIO_POSITION
 
 
 # =====================================================================
@@ -183,7 +190,7 @@ class OptConfig:
 # =====================================================================
 # 8) Regret-grid (G = Lambda x M)
 # =====================================================================
-LAMBDA_GRID: Tuple[float, ...] = (0.05, 1, 3, 5, 10)
+LAMBDA_GRID: Tuple[float, ...] = (0.05, 1, 10, 20, 30)
 M_GRID:      Tuple[float, ...] = (0.5, 3.0, 5.0)
 
 
